@@ -25,7 +25,10 @@ object OpenFluxKernel : Kernel {
     override val variant: KernelVariant = KernelVariant.OPENFLUX
     // --url carries the Yandex.Docs document link, which is effectively the shared secret/
     // rendezvous point for that transport - as sensitive as FreeTurn's -links/-sub.
-    override val sensitiveCommandFlags: Set<String> = setOf("--maxToken", "--url", "--session-context")
+    override val sensitiveCommandFlags: Set<String> = setOf(
+        "--maxToken", "--url", "--session-context", "--direct-dial",
+        "--yandex-url", "--vyandex-url", "--boards-url", "--mailru-url", "--cupsonline-url"
+    )
     override val displayNameRes: Int = R.string.kernel_openflux
     override val configActivityClass = OpenFluxConfigActivity::class.java
     override val wgNotUsedMessageRes: Int = R.string.wg_not_used_with_openflux
@@ -252,9 +255,31 @@ object OpenFluxKernel : Kernel {
             "--role", "client",
             // "--inbound" deliberately left unset: it defaults to socks5 on every non-macOS
             // platform (Android included), which is what cfg.socksAddr below expects.
-            "--socks5", cfg.socksAddr.ifBlank { ClientConfig.DEFAULT_SOCKS_ADDR },
-            "--transport", o.transport
+            "--socks5", cfg.socksAddr.ifBlank { ClientConfig.DEFAULT_SOCKS_ADDR }
         ))
+        if (o.isSession) {
+            // An authenticated Session over one or two carriers (main.go: --transports/--negotiate).
+            // --transports takes "type:priority" pairs, each carrier's address comes from its own
+            // flag (--direct-dial for the direct one, --<type>-url for a document carrier), and
+            // --url / --codec stay out: the Session is always batched and the
+            // context comes from --session-context or from the carriers' own URLs (kdfcontext.go).
+            cmdArgs.addAll(listOf(
+                "--transports", o.sessionCarriers.joinToString(",") { (type, priority) -> "$type:$priority" },
+                // Ignored for the carrier list, but main.go names the cookie jar after it (the
+                // default "yandex" would give a mailru profile cookies-yandex.json).
+                "--transport", o.transport
+            ))
+            if (o.hasDirect) cmdArgs.addAll(listOf("--direct-dial", o.directDial))
+            o.documentTransport?.let { cmdArgs.addAll(listOf("--$it-url", o.url)) }
+            if (o.negotiate) cmdArgs.add("--negotiate")
+            cmdArgs.add("--debug=2")
+            val keyFile = File(ctx.filesDir, "openflux_key.txt")
+            keyFile.writeText(o.encryptionKey)
+            cmdArgs.addAll(listOf("--encryption-key-file", keyFile.absolutePath))
+            o.effectiveSessionContext?.let { cmdArgs.addAll(listOf("--session-context", it)) }
+            return cmdArgs
+        }
+        cmdArgs.addAll(listOf("--transport", o.transport))
         // The mode without a server: the stream mux to a PHP exit, still SOCKS5 without --inbound.
         // It has no codec, key or context of its own, so the classic flags below stay out.
         if (o.isStream) cmdArgs.addAll(listOf("--mode", OpenFluxConfig.MODE_STREAM))
@@ -293,6 +318,49 @@ object OpenFluxKernel : Kernel {
         return cmdArgs
     }
 
+    // Session mode (see buildCommand): "[SESSION] handshake OK: peer=..." is the only definite
+    // "the exit is there and the keys match" line - it comes from the client's Start(), which
+    // blocks for up to 20s waiting for it. "Running as CLIENT" only means the SOCKS5 listener is
+    // up. Carriers that don't start are retried by the core ("[SESSION] carrier "X" failed to
+    // start: ...; retrying in the background"), and one of two carriers being down is no reason
+    // to drop the tunnel, so those only keep the status at Connecting while nothing is up yet.
+    private fun parseSessionLogLine(line: String, lower: String, state: BinaryOutputState, ctx: KernelLogContext): Boolean {
+        if (lower.startsWith("panic:") ||
+            lower.contains("failed to start transport") ||
+            lower.contains("require --encryption-key-file") ||
+            lower.contains("is too short") ||
+            lower.contains("--transports:") ||
+            lower.contains("unknown transport type")
+        ) {
+            return failFast(line, state, ctx)
+        }
+        if (lower.contains("=== openflux ===")) {
+            if (canUpdateConnectingStatus()) markConnecting()
+            state.startupEmitted = true
+        }
+        if (lower.contains("running as client (socks5 on")) {
+            state.startupEmitted = true
+            if (CoreServiceState.status.value !is CoreStatus.Connected && canUpdateConnectingStatus()) markConnecting()
+        }
+        if (lower.contains("[session] handshake ok")) {
+            if (CoreServiceState.status.value !is CoreStatus.Suppressed) {
+                CoreServiceState.setStatus(CoreStatus.Connected)
+                ctx.updateNotification(ctx.getString(R.string.core_active))
+            }
+            state.startupEmitted = true
+        } else if (lower.contains("[session] handshake failed") || lower.contains("[session] handshake not complete") ||
+            (lower.contains("[session] carrier") && lower.contains("failed to start"))
+        ) {
+            if (ctx.isNetworkMissingAndHandled()) {
+                state.startupFailed = true
+                return true
+            }
+            if (CoreServiceState.status.value !is CoreStatus.Connected && canUpdateConnectingStatus()) markConnecting()
+            state.startupEmitted = true
+        }
+        return false
+    }
+
     // "Running as CLIENT" is printed the instant main.go's trans.Start() call *returns* - but
     // both transports' Start() only kick off their handshake in a background goroutine and
     // return immediately (see external/openflux transport/yandex/yandex.go:68-78 and
@@ -300,7 +368,13 @@ object OpenFluxKernel : Kernel {
     // signal for either one. It's kept as the Connected signal only for Yandex, which has no
     // better one at all (see below); MAX gets a real one from its own call-signaling log.
     override suspend fun parseLogLine(line: String, lower: String, state: BinaryOutputState, ctx: KernelLogContext, cfg: ClientConfig): Boolean {
-        val transport = (cfg.kernelConfig as? KernelConfig.OpenFlux)?.config?.transport ?: "yandex"
+        val openFluxConfig = (cfg.kernelConfig as? KernelConfig.OpenFlux)?.config
+        val transport = openFluxConfig?.transport ?: "yandex"
+
+        // A Session (--transports/--negotiate) has its own definite signals and recovers carriers
+        // on its own, so the per-transport heuristics below (written for one carrier whose
+        // trouble means the tunnel is down) don't apply to it.
+        if (openFluxConfig?.isSession == true) return parseSessionLogLine(line, lower, state, ctx)
 
         // 0a/0b/0c/0e/0f (see FAST_FAIL_RULES above for what each one matches and why). Checked before
         // the generic "failed to start transport" catch-all further below, which would otherwise

@@ -360,8 +360,8 @@ fun OpenFluxConfigScreen(
             // Per-platform fields - only one of these is ever relevant at a time, same
             // MutableTransitionState/AnimatedVisibility pattern olcRTC uses for its own
             // vp8channel/seichannel/videochannel sections.
-            val yandexVisible = remember { MutableTransitionState(initialConfig.transport != "oneme") }
-            yandexVisible.targetState = config.transport != "oneme"
+            val yandexVisible = remember { MutableTransitionState(initialConfig.transport != "oneme" && initialConfig.transport != "direct") }
+            yandexVisible.targetState = config.transport != "oneme" && config.transport != "direct"
 
             val onemeVisible = remember { MutableTransitionState(initialConfig.transport == "oneme") }
             onemeVisible.targetState = config.transport == "oneme"
@@ -466,20 +466,54 @@ fun OpenFluxConfigScreen(
                 }
             }
 
+            // The authenticated Session and its direct carrier (what links from newer exits and
+            // panels carry: negotiate + direct + a document carrier). Not for MAX (its token flags
+            // have no Session path here), Telemost (no per-carrier URL flag) or the stream mode.
+            ExpandableSection(visible = !config.isStream && config.transport != "oneme" && config.transport != "telemost") {
+                SectionGroup(title = stringResource(R.string.openflux_session_settings_title)) {
+                    SectionItem(position = ItemPosition.Top) {
+                        SwitchRow(
+                            label = stringResource(R.string.openflux_negotiate_label),
+                            // A direct carrier only works inside a Session, so it pins the switch.
+                            checked = config.negotiate || config.hasDirect,
+                            onCheckedChange = { if (!config.hasDirect) config = config.copy(negotiate = it) },
+                            supportingText = stringResource(R.string.openflux_negotiate_desc),
+                            isModified = isEditMode && config.negotiate != initialConfig.negotiate
+                        )
+                    }
+                    SectionItem(position = ItemPosition.Bottom) {
+                        TextFieldRow(
+                            label = stringResource(R.string.openflux_direct_dial_label),
+                            value = config.directDial.redact(isPrivacyActive),
+                            onValueChange = { if (!isPrivacyActive) config = config.copy(directDial = it) },
+                            readOnly = isPrivacyActive,
+                            isError = config.transport == "direct" && config.directDial.isBlank(),
+                            isModified = isEditMode && config.directDial != initialConfig.directDial,
+                            privacyMode = isPrivacyActive,
+                            placeholder = "host:port",
+                            supportingText = stringResource(R.string.openflux_direct_dial_desc)
+                        )
+                    }
+                }
+            }
+
             // Codec and encryption are the classic tunnel's - the stream mode has neither.
             ExpandableSection(visible = !config.isStream) {
                 Column(verticalArrangement = Arrangement.spacedBy(19.dp)) {
                     // Transport-agnostic, like Encryption below - the binary wraps every transport
                     // (including oneme) with the same codec layer.
-                    SectionGroup(title = stringResource(R.string.openflux_advanced_settings_title)) {
-                        SectionItem(position = ItemPosition.Single) {
-                            SwitchRow(
-                                label = stringResource(R.string.openflux_legacy_codec_label),
-                                checked = config.legacyCodec,
-                                onCheckedChange = { config = config.copy(legacyCodec = it) },
-                                supportingText = stringResource(R.string.openflux_legacy_codec_desc),
-                                isModified = isEditMode && config.legacyCodec != initialConfig.legacyCodec
-                            )
+                    // A Session is always batched (the core refuses --negotiate with --codec=legacy).
+                    ExpandableSection(visible = !config.isSession) {
+                        SectionGroup(title = stringResource(R.string.openflux_advanced_settings_title)) {
+                            SectionItem(position = ItemPosition.Single) {
+                                SwitchRow(
+                                    label = stringResource(R.string.openflux_legacy_codec_label),
+                                    checked = config.legacyCodec,
+                                    onCheckedChange = { config = config.copy(legacyCodec = it) },
+                                    supportingText = stringResource(R.string.openflux_legacy_codec_desc),
+                                    isModified = isEditMode && config.legacyCodec != initialConfig.legacyCodec
+                                )
+                            }
                         }
                     }
 
@@ -564,6 +598,7 @@ private fun getOpenFluxPlatformIcon(transport: String): Int = when (transport) {
     "mailru" -> R.drawable.ic_mailru
     "boards" -> R.drawable.ic_yandex_boards
     "telemost" -> R.drawable.ic_telemost
+    "direct" -> R.drawable.route_24px
     else -> R.drawable.ic_yandex_docs
 }
 
@@ -573,7 +608,7 @@ private fun OpenFluxPlatformDialog(
     onSelect: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
-    val platforms = listOf("yandex", "vyandex", "boards", "telemost", "oneme", "cupsonline", "mailru")
+    val platforms = listOf("yandex", "vyandex", "boards", "telemost", "oneme", "cupsonline", "mailru", "direct")
 
     SelectionDialog(
         title = stringResource(R.string.openflux_platform_label),
