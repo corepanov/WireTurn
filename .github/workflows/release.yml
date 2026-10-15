@@ -129,17 +129,21 @@ jobs:
       - name: Build with Gradle
         run: ./gradlew assembleRelease -Pandroid.ndkVersion=${{ steps.vars.outputs.ndk_version }}
 
-      - name: Sign APK
-        uses: r0adkll/sign-android-release@v1
-        id: sign_app
-        with:
-          releaseDirectory: app/build/outputs/apk/release
-          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
-          alias: ${{ secrets.ALIAS }}
-          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
-        env:
-          BUILD_TOOLS_VERSION: ${{ steps.vars.outputs.build_tools }}
+      # Fork build: the original's secret signing key isn't available here, so the APK is signed
+      # with a throwaway key generated on the fly. It installs fine, but not over the official
+      # app (different signature) - uninstall that one first.
+      - name: Sign APK (test key)
+        run: |
+          keytool -genkeypair -keystore test.jks -storepass android -keypass android \
+            -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=WireTurn Test"
+          BT="$ANDROID_HOME/build-tools/${{ steps.vars.outputs.build_tools }}"
+          for f in app/build/outputs/apk/release/*-unsigned.apk; do
+            base="${f%-unsigned.apk}"
+            "$BT/zipalign" -p -f 4 "$f" "$base-aligned.apk"
+            "$BT/apksigner" sign --ks test.jks --ks-pass pass:android --key-pass pass:android \
+              --out "$base-signed.apk" "$base-aligned.apk"
+          done
+          ls -la app/build/outputs/apk/release
 
       - name: Clean up and Rename APKs
         run: |
