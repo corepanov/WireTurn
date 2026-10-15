@@ -324,7 +324,7 @@ object OpenFluxKernel : Kernel {
     // up. Carriers that don't start are retried by the core ("[SESSION] carrier "X" failed to
     // start: ...; retrying in the background"), and one of two carriers being down is no reason
     // to drop the tunnel, so those only keep the status at Connecting while nothing is up yet.
-    private fun parseSessionLogLine(line: String, lower: String, state: BinaryOutputState, ctx: KernelLogContext): Boolean {
+    private suspend fun parseSessionLogLine(line: String, lower: String, state: BinaryOutputState, ctx: KernelLogContext): Boolean {
         if (lower.startsWith("panic:") ||
             lower.contains("failed to start transport") ||
             lower.contains("require --encryption-key-file") ||
