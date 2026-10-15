@@ -137,11 +137,13 @@ jobs:
           keytool -genkeypair -keystore test.jks -storepass android -keypass android \
             -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=WireTurn Test"
           BT="$ANDROID_HOME/build-tools/${{ steps.vars.outputs.build_tools }}"
-          for f in app/build/outputs/apk/release/*-unsigned.apk; do
-            base="${f%-unsigned.apk}"
-            "$BT/zipalign" -p -f 4 "$f" "$base-aligned.apk"
+          ls -la app/build/outputs/apk/release
+          # Gradle names these WireTurn_v<version>_<abi>.apk (no "-unsigned" in the name).
+          for f in app/build/outputs/apk/release/*.apk; do
+            base="${f%.apk}"
+            "$BT/zipalign" -p -f 4 "$f" "/tmp/$(basename "$base")-aligned.apk"
             "$BT/apksigner" sign --ks test.jks --ks-pass pass:android --key-pass pass:android \
-              --out "$base-signed.apk" "$base-aligned.apk"
+              --out "$base-signed.apk" "/tmp/$(basename "$base")-aligned.apk"
           done
           ls -la app/build/outputs/apk/release
 
